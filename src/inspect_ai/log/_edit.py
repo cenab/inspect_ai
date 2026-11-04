@@ -151,40 +151,35 @@ def edit_eval_log(
 
 def _prepare_samples(
     log: EvalLog, sample_uuids: Sequence[str] | Literal["all"]
-) -> dict[str, tuple[int, EvalSample]]:
-    sample_uuid_map = {
-        str(sample.uuid): (idx_sample, sample)
-        for idx_sample, sample in enumerate(log.samples or [])
-    }
-
+) -> dict[int, EvalSample]:
+    samples = log.samples or []
     if sample_uuids == "all":
-        sample_uuid_list = list(sample_uuid_map.keys())
-    else:
-        invalid_sample_uuids = [
-            sample_uuid
-            for sample_uuid in sample_uuids
-            if sample_uuid not in sample_uuid_map
-        ]
-        if invalid_sample_uuids:
-            raise ValueError(f"Samples {invalid_sample_uuids} not found in log")
+        return dict(enumerate(samples))
 
-        sample_uuid_list = list(sample_uuids)
-
-    return {
-        sample_uuid: sample_uuid_map[sample_uuid] for sample_uuid in sample_uuid_list
+    sample_uuid_map = {
+        str(sample.uuid): idx_sample for idx_sample, sample in enumerate(samples)
     }
+    invalid_sample_uuids = [
+        sample_uuid
+        for sample_uuid in sample_uuids
+        if sample_uuid not in sample_uuid_map
+    ]
+    if invalid_sample_uuids:
+        raise ValueError(f"Samples {invalid_sample_uuids} not found in log")
+    selected_indices = (sample_uuid_map[sample_uuid] for sample_uuid in sample_uuids)
+    return {index: samples[index] for index in selected_indices}
 
 
 def _update_sample_invalidation(
     log: EvalLog,
-    sample_uuid_map: dict[str, tuple[int, EvalSample]],
+    selected_samples: dict[int, EvalSample],
     provenance: ProvenanceData | None = None,
 ) -> EvalLog:
-    if not sample_uuid_map:
+    if not selected_samples:
         return log
 
     samples = (log.samples or []).copy()
-    for idx_sample, sample in sample_uuid_map.values():
+    for idx_sample, sample in selected_samples.items():
         if provenance is None:
             if sample.invalidation is None:
                 continue
@@ -218,10 +213,10 @@ def invalidate_samples(
     Returns:
        `EvalLog` with invalidated samples and `invalidated=True`.
     """
-    sample_uuid_map = _prepare_samples(log, sample_uuids)
-    if not sample_uuid_map:
+    selected_samples = _prepare_samples(log, sample_uuids)
+    if not selected_samples:
         return log
-    log = _update_sample_invalidation(log, sample_uuid_map, provenance=provenance)
+    log = _update_sample_invalidation(log, selected_samples, provenance=provenance)
     log.invalidated = True
     return log
 
@@ -242,10 +237,10 @@ def uninvalidate_samples(
     Returns:
        `EvalLog` with uninvalidate samples and updated global `invalidated` state.
     """
-    sample_uuid_map = _prepare_samples(log, sample_uuids)
-    if not sample_uuid_map:
+    selected_samples = _prepare_samples(log, sample_uuids)
+    if not selected_samples:
         return log
-    log = _update_sample_invalidation(log, sample_uuid_map, provenance=None)
+    log = _update_sample_invalidation(log, selected_samples, provenance=None)
     log.invalidated = any(
         sample.invalidation is not None for sample in log.samples or []
     )

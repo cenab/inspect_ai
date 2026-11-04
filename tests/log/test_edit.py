@@ -1,4 +1,5 @@
 import contextlib
+from pathlib import Path
 from typing import Literal, Type
 
 import pytest
@@ -10,6 +11,7 @@ from inspect_ai.log._edit import (
     invalidate_samples,
     uninvalidate_samples,
 )
+from inspect_ai.log._file import read_eval_log, write_eval_log
 from inspect_ai.log._log import EvalConfig, EvalDataset, EvalLog, EvalSample, EvalSpec
 
 
@@ -147,6 +149,57 @@ def test_uninvalidate_samples(
             assert sample.invalidation.reason == "test_reason"
         else:
             assert sample.invalidation is None
+
+
+@pytest.mark.parametrize("log_format", ["eval", "json"])
+@pytest.mark.parametrize("uuid_mode", ["missing", "mixed", "present"])
+@pytest.mark.parametrize("restore", [False, True])
+def test_edit_all_samples_with_legacy_uuids(
+    tmp_path: Path,
+    log_format: Literal["eval", "json"],
+    uuid_mode: Literal["missing", "mixed", "present"],
+    restore: bool,
+) -> None:
+    log = read_eval_log(Path(__file__).parent / "test_eval_log/log_streaming.eval")
+    assert log.samples is not None and len(log.samples) == 4
+    assert all(sample.uuid is None for sample in log.samples)
+    for index, sample in enumerate(log.samples):
+        if uuid_mode == "present" or (uuid_mode == "mixed" and index == 0):
+            sample.uuid = f"sample-{index}"
+    original_uuids = [sample.uuid for sample in log.samples]
+    provenance = ProvenanceData(author="sample-review", reason="incorrect input")
+    if restore:
+        for sample in log.samples:
+            sample.invalidation = provenance.model_copy()
+        log.invalidated = True
+
+    edited = (
+        uninvalidate_samples(log, "all")
+        if restore
+        else invalidate_samples(log, "all", provenance)
+    )
+    assert edited.samples is not None
+    assert edited.invalidated is not restore
+    assert [sample.uuid for sample in edited.samples] == original_uuids
+    assert all(
+        sample.invalidation == (None if restore else provenance)
+        for sample in edited.samples
+    )
+    assert all(
+        sample.invalidation == (provenance if restore else None)
+        for sample in log.samples
+    )
+
+    output = tmp_path / f"edited.{log_format}"
+    write_eval_log(edited, output)
+    persisted = read_eval_log(output)
+    assert persisted.samples is not None
+    assert persisted.invalidated is not restore
+    assert [sample.uuid for sample in persisted.samples] == original_uuids
+    assert all(
+        sample.invalidation == (None if restore else provenance)
+        for sample in persisted.samples
+    )
 
 
 # ---------------------------------------------------------------------------
