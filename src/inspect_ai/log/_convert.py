@@ -5,7 +5,7 @@ import anyio
 
 from inspect_ai._util._async import run_coroutine
 from inspect_ai._util.error import PrerequisiteError
-from inspect_ai._util.file import exists, filesystem
+from inspect_ai._util.file import exists, filesystem, local_path
 from inspect_ai.log import resolve_sample_attachments
 from inspect_ai.log._condense import condense_sample
 from inspect_ai.log._file import (
@@ -122,6 +122,8 @@ async def _stream_convert_file(
 ) -> None:
     input_recorder = recorder_type_for_location(input_file)
     output_recorder = create_recorder_for_location(output_file, output_dir)
+    # Existing outputs, including in-place inputs, stay intact until completion.
+    new_output = not filesystem(output_file).exists(local_path(output_file))
 
     sample_map = await input_recorder.read_log_sample_ids(input_file)
 
@@ -148,28 +150,34 @@ async def _stream_convert_file(
             samples_processed += 1
             # Flush periodically to avoid too much buffering
             if samples_processed % concurrent_limit == 0:
-                await output_recorder.flush(log_header.eval)
+                if new_output:
+                    await output_recorder.flush(log_header.eval)
+                else:
+                    await output_recorder.write_buffered_samples(log_header.eval)
 
     log_header = await read_eval_log_async(
         input_file, header_only=True, resolve_attachments=resolve_attachments
     )
-    # read before log_init: an in-place conversion flushes over the input
     reductions = await input_recorder.read_log_reductions(input_file)
     await output_recorder.log_init(log_header.eval, location=output_file)
-    await output_recorder.log_start(log_header.eval, log_header.plan)
+    try:
+        await output_recorder.log_start(log_header.eval, log_header.plan)
 
-    async with anyio.create_task_group() as tg:
-        for sample_id, epoch in sample_map:
-            tg.start_soon(_convert_sample, sample_id, epoch)
+        async with anyio.create_task_group() as tg:
+            for sample_id, epoch in sample_map:
+                tg.start_soon(_convert_sample, sample_id, epoch)
 
-    await output_recorder.log_finish(
-        log_header.eval,
-        log_header.status,
-        log_header.stats,
-        log_header.results,
-        reductions,
-        error=log_header.error,
-        invalidated=log_header.invalidated,
-        log_updates=log_header.log_updates,
-        config_updates=log_header.config_updates,
-    )
+        await output_recorder.log_finish(
+            log_header.eval,
+            log_header.status,
+            log_header.stats,
+            log_header.results,
+            reductions,
+            error=log_header.error,
+            invalidated=log_header.invalidated,
+            log_updates=log_header.log_updates,
+            config_updates=log_header.config_updates,
+        )
+    finally:
+        with anyio.CancelScope(shield=True):
+            await output_recorder.log_discard(log_header.eval, keep_destination=True)

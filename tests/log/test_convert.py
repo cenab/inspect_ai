@@ -2,23 +2,32 @@ import json
 import pathlib
 import re
 import zipfile
-from typing import Literal, NamedTuple
+from typing import BinaryIO, Literal, NamedTuple
 
+import anyio
 import pytest
 from test_helpers.chunked_corpus import CORPUS_SMALL_CHUNK_SIZE, ChunkedCorpus
 
 from inspect_ai._util.constants import get_deserializing_context
 from inspect_ai.event import ModelEvent, SampleInitEvent
 from inspect_ai.log import EvalError
-from inspect_ai.log._convert import convert_eval_logs
+from inspect_ai.log import _convert as convert_module
+from inspect_ai.log._condense import condense_sample
+from inspect_ai.log._convert import _stream_convert_file, convert_eval_logs
 from inspect_ai.log._edit import (
     MetadataEdit,
     ProvenanceData,
     TagsEdit,
     edit_eval_log,
 )
-from inspect_ai.log._file import read_eval_log, write_eval_log
+from inspect_ai.log._file import (
+    read_eval_log,
+    read_eval_log_async,
+    write_eval_log,
+    write_eval_log_async,
+)
 from inspect_ai.log._log import EvalLog, EvalSample
+from inspect_ai.log._recorders import Recorder, create_recorder_for_location
 from inspect_ai.log._recorders.chunked import convert_eval_logs_to_chunked
 from inspect_ai.log._recorders.chunked.format import (
     attachment_chunk_boundaries,
@@ -36,6 +45,8 @@ from inspect_ai.log._recorders.chunked.format import (
     skeleton_entry_name,
 )
 from inspect_ai.log._recorders.chunked.stats import event_stats
+from inspect_ai.log._recorders.eval import EvalRecorder
+from inspect_ai.log._recorders.json import JSONRecorder
 from inspect_ai.log._resolve import resolve_sample_events_data
 
 _TESTS_DIR = pathlib.Path(__file__).resolve().parent
@@ -244,6 +255,109 @@ def test_convert_in_place_preserves_reductions(
     converted = read_eval_log(str(source_file))
     assert converted.samples
     assert converted.reductions == log.reductions
+
+
+@pytest.mark.parametrize("stream", [1, 2, True])
+@pytest.mark.parametrize("format", ["eval", "json"])
+@pytest.mark.parametrize("file_uri", [False, True])
+async def test_stream_convert_in_place_preserves_all_samples(
+    tmp_path: pathlib.Path,
+    stream: int | Literal[True],
+    format: Literal["eval", "json"],
+    file_uri: bool,
+) -> None:
+    log = await read_eval_log_async(
+        str(_TESTS_DIR / "test_eval_log/log_streaming.eval")
+    )
+    input_file = tmp_path / f"conversion log.{format}"
+    await write_eval_log_async(log, str(input_file))
+    before = await read_eval_log_async(str(input_file))
+    assert before.samples is not None and len(before.samples) == 4
+
+    await _stream_convert_file(
+        str(input_file),
+        input_file.as_uri() if file_uri else str(input_file),
+        str(tmp_path),
+        False,
+        stream,
+    )
+
+    after = await read_eval_log_async(str(input_file))
+    assert after.samples is not None
+    assert [sample.model_dump() for sample in after.samples] == [
+        sample.model_dump() for sample in before.samples
+    ]
+    assert after.status == before.status
+    assert after.results == before.results
+    assert after.reductions == before.reductions
+    assert after.eval == before.eval
+
+
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+@pytest.mark.parametrize("format", ["eval", "json"])
+@pytest.mark.parametrize("existing_output", [True, False])
+async def test_stream_convert_failure_preserves_existing_output(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Literal["error", "cancel"],
+    format: Literal["eval", "json"],
+    existing_output: bool,
+) -> None:
+    log = await read_eval_log_async(
+        str(_TESTS_DIR / "test_eval_log/log_streaming.eval")
+    )
+    input_file = tmp_path / f"conversion log.{format}"
+    await write_eval_log_async(log, str(input_file))
+    original = input_file.read_bytes()
+    output_file = input_file if existing_output else tmp_path / f"new.{format}"
+    recorders: list[EvalRecorder | JSONRecorder] = []
+    temporary_files: list[BinaryIO] = []
+    samples_started = 0
+
+    def create_recorder(location: str, log_dir: str) -> Recorder:
+        recorder = create_recorder_for_location(location, log_dir)
+        assert isinstance(recorder, (EvalRecorder, JSONRecorder))
+        recorders.append(recorder)
+        return recorder
+
+    def fail_after_first_sample(sample: EvalSample) -> EvalSample:
+        nonlocal samples_started
+        samples_started += 1
+        if samples_started == 1 and isinstance(recorders[0], EvalRecorder):
+            temporary_files.extend(
+                zip_log._temp_file for zip_log in recorders[0].data.values()
+            )
+        if samples_started >= 2:
+            if failure == "error":
+                raise RuntimeError("conversion failed")
+            scope.cancel()
+        return condense_sample(sample)
+
+    monkeypatch.setattr(convert_module, "condense_sample", fail_after_first_sample)
+    monkeypatch.setattr(convert_module, "create_recorder_for_location", create_recorder)
+    with anyio.CancelScope() as scope:
+        if failure == "error":
+            with pytest.raises(ExceptionGroup) as error:
+                await _stream_convert_file(
+                    str(input_file), output_file.as_uri(), str(tmp_path), False, 1
+                )
+            assert any(
+                isinstance(exception, RuntimeError)
+                and str(exception) == "conversion failed"
+                for exception in error.value.exceptions
+            )
+        else:
+            await _stream_convert_file(
+                str(input_file), output_file.as_uri(), str(tmp_path), False, 1
+            )
+    assert samples_started >= 2
+    assert input_file.read_bytes() == original
+    assert recorders[0].data == {}
+    assert all(file.closed for file in temporary_files)
+    if not existing_output:
+        partial = await read_eval_log_async(str(output_file))
+        assert partial.status == "started"
+        assert partial.samples is not None and len(partial.samples) == 1
 
 
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "no-stream"])
