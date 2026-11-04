@@ -12,8 +12,8 @@ from ._target import Target
 
 def match_target(match: str, target: Target, ignore_case: bool) -> bool:
     if ignore_case:
-        match = match.lower()
-        target = Target([t.lower() for t in target])
+        match = match.casefold()
+        target = Target([t.casefold() for t in target])
 
     return match in target
 

@@ -42,6 +42,42 @@ async def test_single_match_case_sensitive():
     assert result.text == CORRECT
 
 
+@pytest.mark.parametrize(
+    ("answer", "target"), [("Σ", "ς"), ("Straße", "STRASSE"), ("STRASSE", "Straße")]
+)
+@pytest.mark.parametrize("ignore_case", [True, False])
+async def test_unicode_case_comparison(
+    answer: str, target: str, ignore_case: bool
+) -> None:
+    result = await pattern("(.*)", ignore_case=ignore_case)(
+        simple_task_state(model_output=answer), Target(target)
+    )
+
+    assert result is not None
+    assert result.text == (CORRECT if ignore_case else INCORRECT)
+    assert result.answer == answer
+    assert result.reason is None
+
+
+@pytest.mark.parametrize(
+    ("regex", "completion", "targets", "match_all"),
+    [
+        ("(Σ) (Straße)", "Σ Straße", ["ς", "STRASSE"], True),
+        ("(unrelated) (Straße)", "unrelated Straße", ["STRASSE"], False),
+        ("Straße", "Straße", ["STRASSE"], False),
+    ],
+)
+async def test_unicode_case_comparison_capture_modes(
+    regex: str, completion: str, targets: list[str], match_all: bool
+) -> None:
+    result = await pattern(regex, match_all=match_all)(
+        simple_task_state(model_output=completion), Target(targets)
+    )
+
+    assert result is not None
+    assert result.text == CORRECT
+
+
 @pytest.mark.anyio
 async def test_multi_match_success_on_first_match():
     scorer = pattern("(foo) (bar)")
