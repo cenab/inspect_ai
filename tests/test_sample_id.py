@@ -52,6 +52,30 @@ def test_sample_id():
     assert len(log.samples) == 10
 
 
+@pytest.mark.parametrize("sample_id", ["²", "①", "₂", "2²", "task-²", "2", "٢", "２"])
+def test_sample_id_unicode_filter(sample_id: str, tmp_path: Path) -> None:
+    task = Task(
+        dataset=[
+            Sample(id=sample_id, input="selected"),
+            Sample(id="other", input="other"),
+        ],
+        solver=[],
+    )
+    log = eval(
+        task,
+        sample_id=sample_id,
+        model="mockllm/model",
+        log_dir=str(tmp_path),
+        display="none",
+        ctl_server=False,
+    )[0]
+
+    assert log.status == "success"
+    assert log.samples is not None
+    assert [sample.id for sample in log.samples] == [sample_id]
+    assert read_eval_log_sample(log.location, sample_id).id == sample_id
+
+
 def test_sample_id_task_preface():
     task = Task(
         name="foo",
