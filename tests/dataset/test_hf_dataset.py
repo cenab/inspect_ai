@@ -1,3 +1,4 @@
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -109,6 +110,89 @@ def test_retry_httpx_timeout(error_type, wrapped, fast_retry):
     assert fn.call_count == 2
 
 
+@pytest.mark.parametrize(
+    "error_name", ["ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"]
+)
+@skip_if_no_package("huggingface_hub")
+@skip_if_no_package("httpx2")
+def test_retry_current_hub_sdk_timeout(
+    error_name: str, fast_retry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx2
+    from huggingface_hub import HfApi
+
+    attempts = 0
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        assert request.url.path == "/api/datasets/test/dataset"
+        assert "authorization" not in request.headers
+        if attempts == 1:
+            raise getattr(httpx2, error_name)("timed out", request=request)
+        return httpx2.Response(200, json={"id": "test/dataset", "sha": "revision"})
+
+    with httpx2.Client(transport=httpx2.MockTransport(respond)) as client:
+        monkeypatch.setattr("huggingface_hub.hf_api.get_session", lambda: client)
+        api = HfApi(token=False)
+        info = _call_with_hf_retry(lambda: api.dataset_info("test/dataset"))
+
+    assert info.id == "test/dataset"
+    assert info.sha == "revision"
+    assert attempts == 2
+
+
+@skip_if_no_package("huggingface_hub")
+@skip_if_no_package("httpx2")
+def test_current_hub_timeout_keeps_retry_limit(
+    fast_retry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx2
+    from huggingface_hub import HfApi
+
+    attempts = 0
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx2.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr("inspect_ai.dataset._sources.hf._hf_max_tries", lambda: 3)
+    with httpx2.Client(transport=httpx2.MockTransport(respond)) as client:
+        monkeypatch.setattr("huggingface_hub.hf_api.get_session", lambda: client)
+        api = HfApi(token=False)
+        with pytest.raises(httpx2.ReadTimeout):
+            _call_with_hf_retry(lambda: api.dataset_info("test/dataset"))
+
+    assert attempts == 3
+
+
+@pytest.mark.parametrize("status", [401, 404])
+@skip_if_no_package("huggingface_hub")
+@skip_if_no_package("httpx2")
+def test_current_hub_nontransient_response_does_not_retry(
+    status: int, fast_retry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx2
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import HfHubHTTPError
+
+    attempts = 0
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx2.Response(status, json={"error": "not available"})
+
+    with httpx2.Client(transport=httpx2.MockTransport(respond)) as client:
+        monkeypatch.setattr("huggingface_hub.hf_api.get_session", lambda: client)
+        api = HfApi(token=False)
+        with pytest.raises(HfHubHTTPError):
+            _call_with_hf_retry(lambda: api.dataset_info("test/dataset"))
+
+    assert attempts == 1
+
+
 def test_no_retry_connection_error_with_unrelated_cause():
     error = ConnectionError("failed")
     error.__cause__ = ValueError("invalid configuration")
@@ -131,6 +215,51 @@ def test_no_retry_hub_offline_mode(fast_retry):
     with pytest.raises(ConnectionError):
         _call_with_hf_retry(fn)
     assert fn.call_count == 1
+
+
+@skip_if_no_package("huggingface_hub")
+def test_no_retry_wrapped_hub_offline_mode(
+    fast_retry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from huggingface_hub import constants
+
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+    error = ConnectionError(
+        "Couldn't reach 'test' on the Hub (LocalEntryNotFoundError)"
+    )
+    fn = MagicMock(side_effect=error)
+    with pytest.raises(ConnectionError):
+        _call_with_hf_retry(fn)
+    assert fn.call_count == 1
+
+
+@skip_if_no_package("datasets")
+def test_no_retry_datasets_wrapped_offline_mode(
+    tmp_path: Path, fast_retry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from huggingface_hub import constants
+
+    datasets = import_module("datasets")
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(datasets.config, "HF_HUB_OFFLINE", False)
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_OFFLINE", False)
+    attempts = 0
+
+    def load() -> None:
+        nonlocal attempts
+        attempts += 1
+        datasets.load_dataset(
+            "inspect-ai-tests/uncached-offline-dataset",
+            split="test",
+            cache_dir=str(tmp_path),
+            token=False,
+        )
+
+    with pytest.raises(
+        ConnectionError, match=r"Couldn't reach .*\(LocalEntryNotFoundError\)"
+    ):
+        _call_with_hf_retry(load)
+    assert attempts == 1
 
 
 def test_no_retry_unrelated_exception():

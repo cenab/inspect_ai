@@ -42,6 +42,13 @@ def _should_retry_hf_error(err: BaseException) -> bool:
     """Return True if `err` is a transient HF failure worth retrying."""
     # datasets can discard the cause when reporting an unreachable Hub.
     if isinstance(err, ConnectionError):
+        try:
+            from huggingface_hub.constants import HF_HUB_OFFLINE
+
+            if HF_HUB_OFFLINE:
+                return False
+        except ImportError:
+            pass
         msg = str(err)
         return (
             "Couldn't reach" in msg
@@ -49,9 +56,17 @@ def _should_retry_hf_error(err: BaseException) -> bool:
             and not msg.endswith("(OfflineModeIsEnabled)")
         )
 
-    # huggingface_hub >= 1.0 uses httpx rather than requests.
+    # Support both HTTP clients used by huggingface_hub releases.
     if isinstance(err, httpx.TimeoutException):
         return True
+
+    try:
+        import httpx2
+
+        if isinstance(err, httpx2.TimeoutException):
+            return True
+    except ImportError:
+        pass
 
     try:
         from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
