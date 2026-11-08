@@ -2,23 +2,34 @@ import json
 import pathlib
 import re
 import zipfile
-from typing import Literal, NamedTuple
+from typing import Any, BinaryIO, Literal, NamedTuple
 
+import anyio
 import pytest
 from test_helpers.chunked_corpus import CORPUS_SMALL_CHUNK_SIZE, ChunkedCorpus
 
 from inspect_ai._util.constants import get_deserializing_context
+from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.file import filesystem
 from inspect_ai.event import ModelEvent, SampleInitEvent
 from inspect_ai.log import EvalError
-from inspect_ai.log._convert import convert_eval_logs
+from inspect_ai.log import _convert as convert_module
+from inspect_ai.log._condense import condense_sample
+from inspect_ai.log._convert import _stream_convert_file, convert_eval_logs
 from inspect_ai.log._edit import (
     MetadataEdit,
     ProvenanceData,
     TagsEdit,
     edit_eval_log,
 )
-from inspect_ai.log._file import read_eval_log, write_eval_log
+from inspect_ai.log._file import (
+    read_eval_log,
+    read_eval_log_async,
+    write_eval_log,
+    write_eval_log_async,
+)
 from inspect_ai.log._log import EvalLog, EvalSample
+from inspect_ai.log._recorders import Recorder, create_recorder_for_location
 from inspect_ai.log._recorders.chunked import convert_eval_logs_to_chunked
 from inspect_ai.log._recorders.chunked.format import (
     attachment_chunk_boundaries,
@@ -36,9 +47,142 @@ from inspect_ai.log._recorders.chunked.format import (
     skeleton_entry_name,
 )
 from inspect_ai.log._recorders.chunked.stats import event_stats
+from inspect_ai.log._recorders.eval import EvalRecorder
+from inspect_ai.log._recorders.json import JSONRecorder
 from inspect_ai.log._resolve import resolve_sample_events_data
 
 _TESTS_DIR = pathlib.Path(__file__).resolve().parent
+
+
+@pytest.mark.parametrize("stream", [False, 1])
+@pytest.mark.parametrize("format", ["eval", "json"])
+@pytest.mark.parametrize("file_uri", [False, True])
+@pytest.mark.parametrize("failure", ["error", "interrupt"])
+def test_convert_in_place_finalization_failure_preserves_input(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool | int,
+    format: Literal["eval", "json"],
+    file_uri: bool,
+    failure: Literal["error", "interrupt"],
+) -> None:
+    log = read_eval_log(str(_TESTS_DIR / "test_eval_log/log_streaming.eval"))
+    input_file = tmp_path / f"conversion log.{format}"
+    write_eval_log(log, str(input_file))
+    original = input_file.read_bytes()
+    failure_type = RuntimeError if failure == "error" else KeyboardInterrupt
+    if stream:
+
+        def create_recorder(location: str, log_dir: str) -> Recorder:
+            recorder = create_recorder_for_location(location, log_dir)
+            finish = recorder.log_finish
+
+            async def fail_after_finish(*args: Any, **kwargs: Any) -> EvalLog:
+                await finish(*args, **kwargs)
+                raise failure_type("finalization failed")
+
+            monkeypatch.setattr(recorder, "log_finish", fail_after_finish)
+            return recorder
+
+        monkeypatch.setattr(
+            convert_module, "create_recorder_for_location", create_recorder
+        )
+    else:
+
+        def fail_after_write(log: EvalLog, destination: str) -> None:
+            write_eval_log(log, destination)
+            raise failure_type("finalization failed")
+
+        monkeypatch.setattr(convert_module, "write_eval_log", fail_after_write)
+    with pytest.raises(failure_type, match="finalization failed"):
+        convert_eval_logs(
+            input_file.as_uri() if file_uri else str(input_file),
+            format,
+            tmp_path.as_uri() if file_uri else str(tmp_path),
+            overwrite=True,
+            stream=stream,
+        )
+    assert input_file.read_bytes() == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == [input_file.name]
+
+
+@pytest.mark.parametrize("format", ["eval", "json"])
+def test_convert_in_place_cancellation_preserves_input(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    format: Literal["eval", "json"],
+) -> None:
+    log = read_eval_log(str(_TESTS_DIR / "test_eval_log/log_streaming.eval"))
+    input_file = tmp_path / f"conversion log.{format}"
+    write_eval_log(log, str(input_file))
+    original = input_file.read_bytes()
+    cancellation_types: list[type[BaseException]] = []
+
+    def create_recorder(location: str, log_dir: str) -> Recorder:
+        recorder = create_recorder_for_location(location, log_dir)
+        finish = recorder.log_finish
+
+        async def cancel_after_finish(*args: Any, **kwargs: Any) -> EvalLog:
+            await finish(*args, **kwargs)
+            cancellation_types.append(anyio.get_cancelled_exc_class())
+            cancellation = None
+            with anyio.CancelScope() as scope:
+                scope.cancel()
+                try:
+                    await anyio.lowlevel.checkpoint()
+                except BaseException as exception:
+                    cancellation = exception
+            assert cancellation is not None
+            raise cancellation
+
+        monkeypatch.setattr(recorder, "log_finish", cancel_after_finish)
+        return recorder
+
+    monkeypatch.setattr(convert_module, "create_recorder_for_location", create_recorder)
+    with pytest.raises(BaseException) as error:
+        convert_eval_logs(
+            str(input_file), format, str(tmp_path), overwrite=True, stream=1
+        )
+    assert cancellation_types and isinstance(error.value, cancellation_types[0])
+    assert input_file.read_bytes() == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == [input_file.name]
+
+
+@pytest.mark.parametrize("stream", [False, 1])
+@pytest.mark.parametrize("format", ["eval", "json"])
+def test_convert_remote_input_requires_distinct_output(
+    tmp_path: pathlib.Path,
+    stream: bool | int,
+    format: Literal["eval", "json"],
+) -> None:
+    log = read_eval_log(str(_TESTS_DIR / "test_eval_log/log_streaming.eval"))
+    local_file = tmp_path / f"input.{format}"
+    write_eval_log(log, str(local_file))
+    log = read_eval_log(str(local_file))
+    original = local_file.read_bytes()
+    remote_dir = f"memory://{tmp_path.name}"
+    remote_file = f"{remote_dir}/input.{format}"
+    fs = filesystem(remote_file)
+    fs.put_file(str(local_file), remote_file)
+    try:
+        with pytest.raises(PrerequisiteError, match="different output directory"):
+            convert_eval_logs(
+                remote_file, format, remote_dir, overwrite=True, stream=stream
+            )
+        assert fs.read_bytes(remote_file) == original
+
+        output_dir = f"{remote_dir}/output"
+        convert_eval_logs(remote_file, format, output_dir, stream=stream)
+        converted = read_eval_log(f"{output_dir}/input.{format}")
+        assert converted.samples is not None and log.samples is not None
+        assert [sample.model_dump() for sample in converted.samples] == [
+            sample.model_dump() for sample in log.samples
+        ]
+        assert converted.status == log.status
+        assert converted.results == log.results
+        assert fs.read_bytes(remote_file) == original
+    finally:
+        fs.rm(remote_dir, recursive=True)
 
 
 @pytest.mark.parametrize(
@@ -244,6 +388,104 @@ def test_convert_in_place_preserves_reductions(
     converted = read_eval_log(str(source_file))
     assert converted.samples
     assert converted.reductions == log.reductions
+
+
+@pytest.mark.parametrize("stream", [1, 2, True])
+@pytest.mark.parametrize("format", ["eval", "json"])
+@pytest.mark.parametrize("file_uri", [False, True])
+def test_stream_convert_in_place_preserves_all_samples(
+    tmp_path: pathlib.Path,
+    stream: int | Literal[True],
+    format: Literal["eval", "json"],
+    file_uri: bool,
+) -> None:
+    log = read_eval_log(str(_TESTS_DIR / "test_eval_log/log_streaming.eval"))
+    input_file = tmp_path / f"conversion log.{format}"
+    write_eval_log(log, str(input_file))
+    before = read_eval_log(str(input_file))
+    assert before.samples is not None and len(before.samples) == 4
+
+    convert_eval_logs(
+        input_file.as_uri() if file_uri else str(input_file),
+        format,
+        tmp_path.as_uri() if file_uri else str(tmp_path),
+        overwrite=True,
+        stream=stream,
+    )
+
+    after = read_eval_log(str(input_file))
+    assert after.samples is not None
+    assert [sample.model_dump() for sample in after.samples] == [
+        sample.model_dump() for sample in before.samples
+    ]
+    assert after.status == before.status
+    assert after.results == before.results
+    assert after.reductions == before.reductions
+    assert after.eval == before.eval
+
+
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+@pytest.mark.parametrize("format", ["eval", "json"])
+async def test_stream_convert_failure_cleans_recorder(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Literal["error", "cancel"],
+    format: Literal["eval", "json"],
+) -> None:
+    log = await read_eval_log_async(
+        str(_TESTS_DIR / "test_eval_log/log_streaming.eval")
+    )
+    input_file = tmp_path / f"conversion log.{format}"
+    await write_eval_log_async(log, str(input_file))
+    original = input_file.read_bytes()
+    output_file = tmp_path / f"new.{format}"
+    recorders: list[EvalRecorder | JSONRecorder] = []
+    temporary_files: list[BinaryIO] = []
+    samples_started = 0
+
+    def create_recorder(location: str, log_dir: str) -> Recorder:
+        recorder = create_recorder_for_location(location, log_dir)
+        assert isinstance(recorder, (EvalRecorder, JSONRecorder))
+        recorders.append(recorder)
+        return recorder
+
+    def fail_after_first_sample(sample: EvalSample) -> EvalSample:
+        nonlocal samples_started
+        samples_started += 1
+        if samples_started == 1 and isinstance(recorders[0], EvalRecorder):
+            temporary_files.extend(
+                zip_log._temp_file for zip_log in recorders[0].data.values()
+            )
+        if samples_started >= 2:
+            if failure == "error":
+                raise RuntimeError("conversion failed")
+            scope.cancel()
+        return condense_sample(sample)
+
+    monkeypatch.setattr(convert_module, "condense_sample", fail_after_first_sample)
+    monkeypatch.setattr(convert_module, "create_recorder_for_location", create_recorder)
+    with anyio.CancelScope() as scope:
+        if failure == "error":
+            with pytest.raises(ExceptionGroup) as error:
+                await _stream_convert_file(
+                    str(input_file), output_file.as_uri(), str(tmp_path), False, 1
+                )
+            assert any(
+                isinstance(exception, RuntimeError)
+                and str(exception) == "conversion failed"
+                for exception in error.value.exceptions
+            )
+        else:
+            await _stream_convert_file(
+                str(input_file), output_file.as_uri(), str(tmp_path), False, 1
+            )
+    assert samples_started >= 2
+    assert input_file.read_bytes() == original
+    assert recorders[0].data == {}
+    assert all(file.closed for file in temporary_files)
+    partial = await read_eval_log_async(str(output_file))
+    assert partial.status == "started"
+    assert partial.samples is not None and len(partial.samples) == 1
 
 
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "no-stream"])

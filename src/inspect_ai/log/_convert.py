@@ -1,11 +1,14 @@
 import os
+import shutil
+import tempfile
 from typing import Literal
 
 import anyio
 
 from inspect_ai._util._async import run_coroutine
+from inspect_ai._util.atomic_write import atomic_write
 from inspect_ai._util.error import PrerequisiteError
-from inspect_ai._util.file import exists, filesystem
+from inspect_ai._util.file import exists, filesystem, local_path
 from inspect_ai.log import resolve_sample_attachments
 from inspect_ai.log._condense import condense_sample
 from inspect_ai.log._file import (
@@ -38,13 +41,18 @@ def convert_eval_logs(
             already in the target format it will just be copied to the output dir.
         output_dir (str): Output directory to write converted log file(s) to.
         overwrite (bool): Overwrite existing log files (defaults to `False`,
-            raising an error if the output file path already exists).
+            raising an error if the output file path already exists). In-place
+            conversion requires a local file; use a different output directory
+            for remote logs.
         resolve_attachments (bool): Resolve attachments (duplicated content blocks)
             to their full content.
         stream (int | bool): Stream samples through the conversion process instead of
             reading the entire log into memory. Useful for large logs.
     """
     from inspect_ai._display import display
+
+    path = local_path(path)
+    output_dir = local_path(output_dir)
 
     # confirm that path exists
     fs = filesystem(path)
@@ -83,20 +91,45 @@ def convert_eval_logs(
                 f"Output file {output_file} already exists (use --overwrite to overwrite existing files)"
             )
 
-        # do a full read/write (normalized deprecated constructs and adds sample summaries)
-        if stream:
-            run_coroutine(
-                _stream_convert_file(
-                    input_file,
-                    output_file,
-                    output_dir,
-                    resolve_attachments,
-                    stream,
+        def convert_output(destination: str) -> None:
+            if stream:
+                run_coroutine(
+                    _stream_convert_file(
+                        input_file,
+                        destination,
+                        output_dir,
+                        resolve_attachments,
+                        stream,
+                    )
                 )
-            )
+            else:
+                log = read_eval_log(input_file, resolve_attachments=resolve_attachments)
+                write_eval_log(log, destination)
+
+        in_place = False
+        if output_fs.exists(output_file):
+            if fs.is_local() and output_fs.is_local():
+                in_place = os.path.samefile(
+                    local_path(input_file), local_path(output_file)
+                )
+            else:
+                in_place = fs.info(input_file).name == output_fs.info(output_file).name
+
+        if in_place:
+            if not output_fs.is_local():
+                raise PrerequisiteError(
+                    "In-place conversion requires a local file for atomic replacement; "
+                    "use a different output directory for remote logs."
+                )
+            # Finalization can fail or be cancelled after a recorder writes its output.
+            with atomic_write(local_path(output_file)) as destination:
+                with tempfile.TemporaryDirectory() as temporary_dir:
+                    staged = os.path.join(temporary_dir, os.path.basename(output_file))
+                    convert_output(staged)
+                    with open(staged, "rb") as source:
+                        shutil.copyfileobj(source, destination)
         else:
-            log = read_eval_log(input_file, resolve_attachments=resolve_attachments)
-            write_eval_log(log, output_file)
+            convert_output(output_file)
 
     if fs.info(path).type == "file":
         convert_file(path)
@@ -153,23 +186,26 @@ async def _stream_convert_file(
     log_header = await read_eval_log_async(
         input_file, header_only=True, resolve_attachments=resolve_attachments
     )
-    # read before log_init: an in-place conversion flushes over the input
     reductions = await input_recorder.read_log_reductions(input_file)
     await output_recorder.log_init(log_header.eval, location=output_file)
-    await output_recorder.log_start(log_header.eval, log_header.plan)
+    try:
+        await output_recorder.log_start(log_header.eval, log_header.plan)
 
-    async with anyio.create_task_group() as tg:
-        for sample_id, epoch in sample_map:
-            tg.start_soon(_convert_sample, sample_id, epoch)
+        async with anyio.create_task_group() as tg:
+            for sample_id, epoch in sample_map:
+                tg.start_soon(_convert_sample, sample_id, epoch)
 
-    await output_recorder.log_finish(
-        log_header.eval,
-        log_header.status,
-        log_header.stats,
-        log_header.results,
-        reductions,
-        error=log_header.error,
-        invalidated=log_header.invalidated,
-        log_updates=log_header.log_updates,
-        config_updates=log_header.config_updates,
-    )
+        await output_recorder.log_finish(
+            log_header.eval,
+            log_header.status,
+            log_header.stats,
+            log_header.results,
+            reductions,
+            error=log_header.error,
+            invalidated=log_header.invalidated,
+            log_updates=log_header.log_updates,
+            config_updates=log_header.config_updates,
+        )
+    finally:
+        with anyio.CancelScope(shield=True):
+            await output_recorder.log_discard(log_header.eval, keep_destination=True)
